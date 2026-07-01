@@ -16,9 +16,10 @@ const OAUTH_CLIENT_ID   = (process.env.GOOGLE_ADS_CLIENT_ID || "").trim();
 const OAUTH_SECRET      = (process.env.GOOGLE_ADS_CLIENT_SECRET || "").trim();
 const REFRESH_TOKEN     = (process.env.GOOGLE_ADS_REFRESH_TOKEN || "").trim();
 
-const DATA_PATH         = path.join(__dirname, "data.json");
-const CAMPAIGNS_PATH    = path.join(__dirname, "campaigns-data.json");
-const GADS_PATH         = path.join(__dirname, "gads-data.json");
+const DATA_PATH              = path.join(__dirname, "data.json");
+const CAMPAIGNS_PATH         = path.join(__dirname, "campaigns-data.json");
+const GADS_PATH              = path.join(__dirname, "gads-data.json");
+const GOOGLE_ADGROUPS_PATH   = path.join(__dirname, "google-adgroups-data.json");
 
 // Destinos conocidos (misma lista que meta-refresh.js)
 const DESTINOS = ["las-arenas","isla-cristina","trafalgar","costa-brava","canos","los-canos","somo-playa","somo","tarifa","ria-de-vigo","roquetas","llanes","tossa-de-mar","cambrils","paloma","kikopark-playa","kikopark","cova-negra","alquezar","bayona-playa","bayona","benicassim","blanes","navajas","lago-de-arcos","sierra-nevada","picos-urbion","picos","el-palmar","palmar"];
@@ -204,13 +205,25 @@ async function refreshGoogleAds(dateFrom, dateTo) {
   fs.writeFileSync(CAMPAIGNS_PATH, JSON.stringify(campFile), "utf8");
   console.log(`  ✅ campaigns-data.json actualizado con Google Ads`);
 
-  // ── 3. Ad group level → data.json (por destino) ─────────────────────────
+  // ── 3. Ad group level → data.json (por destino) + google-adgroups-data.json
   console.log(`  Fetching Google Ads ad groups (destinos) ${dateFrom} → ${dateTo}...`);
   const adGroupResults = await queryGoogleAds(accessToken, `
     SELECT
+      campaign.id,
+      campaign.name,
+      ad_group.id,
       ad_group.name,
       segments.date,
-      metrics.cost_micros
+      metrics.cost_micros,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.ctr,
+      metrics.average_cpc,
+      metrics.conversions,
+      metrics.conversions_value,
+      metrics.all_conversions,
+      metrics.all_conversions_value,
+      metrics.video_views
     FROM ad_group
     WHERE segments.date BETWEEN '${dateFrom}' AND '${dateTo}'
       AND ad_group.status != 'REMOVED'
@@ -219,15 +232,51 @@ async function refreshGoogleAds(dateFrom, dateTo) {
     ORDER BY segments.date
   `);
 
-  // Agrupar por fecha y destino
   const destByDate = {};
+  const adGroupRows = [];
+
   adGroupResults.forEach(r => {
     const date = r.segments.date;
-    const dest = extractDestinationFromAdGroup(r.adGroup.name || "");
+    const adGroupName = r.adGroup.name || "";
+    const dest = extractDestinationFromAdGroup(adGroupName);
     const spend = (r.metrics.costMicros || 0) / 1_000_000;
+
     if (!destByDate[date]) destByDate[date] = {};
     destByDate[date][dest] = (destByDate[date][dest] || 0) + spend;
+
+    adGroupRows.push([
+      date.replace(/-/g, ""),
+      r.campaign.id   || "",
+      r.campaign.name || "",
+      r.adGroup.id    || "",
+      adGroupName,
+      dest,
+      Math.round(spend * 100) / 100,
+      parseInt(r.metrics.impressions)                                        || 0,
+      parseInt(r.metrics.clicks)                                             || 0,
+      Math.round((parseFloat(r.metrics.ctr)        || 0) * 10000) / 10000,
+      Math.round(((r.metrics.averageCpc || 0) / 1_000_000) * 100)  / 100,
+      Math.round(parseFloat(r.metrics.conversions)                  || 0),
+      Math.round(parseFloat(r.metrics.conversionsValue)             || 0),
+      Math.round(parseFloat(r.metrics.allConversions)               || 0),
+      Math.round(parseFloat(r.metrics.allConversionsValue)          || 0),
+      parseInt(r.metrics.videoViews)                                         || 0,
+    ]);
   });
+
+  // Guardar google-adgroups-data.json
+  const gAdGroupsFile = loadJson(GOOGLE_ADGROUPS_PATH, {
+    updated: "",
+    cols: ["date","campaign_id","campaign_name","adgroup_id","adgroup_name","dest","spend","impressions","clicks","ctr","avg_cpc","conversions","conversions_value","all_conversions","all_conversions_value","video_views"],
+    rows: [],
+  });
+  if (!Array.isArray(gAdGroupsFile.rows)) gAdGroupsFile.rows = [];
+  gAdGroupsFile.rows = gAdGroupsFile.rows.filter(r => { const d = parseInt(String(r[0])); return d < fromNum || d > toNum; });
+  gAdGroupsFile.rows.push(...adGroupRows);
+  gAdGroupsFile.rows.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  gAdGroupsFile.updated = dateTo;
+  fs.writeFileSync(GOOGLE_ADGROUPS_PATH, JSON.stringify(gAdGroupsFile), "utf8");
+  console.log(`  ✅ google-adgroups-data.json — ${adGroupRows.length} filas`);
 
   const dataFile = loadJson(DATA_PATH, { v: 1, updated: "", days: {} });
   Object.keys(dataFile.days).forEach(dateStr => {

@@ -13,6 +13,7 @@ const path = require("path");
 const ACCESS_TOKEN      = process.env.META_ACCESS_TOKEN;
 const AD_ACCOUNT_ID     = process.env.META_AD_ACCOUNT_ID;
 const META_PATH         = path.join(__dirname, "meta-data.json");
+const META_ADS_PATH     = path.join(__dirname, "meta-ads-data.json");
 const DATA_PATH         = path.join(__dirname, "data.json");
 const CAMPAIGNS_PATH    = path.join(__dirname, "campaigns-data.json");
 const API_VERSION       = "v21.0";
@@ -155,38 +156,88 @@ async function refreshMeta(dateFrom, dateTo) {
   fs.writeFileSync(CAMPAIGNS_PATH, JSON.stringify(campFile), "utf8");
   console.log(`  ✅ campaigns-data.json actualizado`);
 
-  // ── 3. Ad-level → data.json (por destino) ───────────────────────────────
+  // ── 3. Ad-level → data.json (por destino) + meta-ads-data.json ─────────
   console.log(`  Fetching Meta ads (destinos) ${dateFrom} → ${dateTo}...`);
   const adRaw = await fetchAllPages(`act_${AD_ACCOUNT_ID}/insights`, {
     level: "ad",
-    fields: "ad_name,spend,actions",
+    fields: "ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,spend,impressions,reach,clicks,ctr,cpm,cpp,actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p100_watched_actions",
     time_range: JSON.stringify({ since: dateFrom, until: dateTo }),
     time_increment: 1,
     limit: 500,
   });
 
-  // Agrupar gasto por fecha y destino
+  const getAction = (actions, type) =>
+    (actions || []).filter(a => a.action_type === type).reduce((s, a) => s + parseInt(a.value || 0), 0);
+
+  const getVideoAction = (arr) =>
+    (arr || []).reduce((s, a) => s + parseInt(a.value || 0), 0);
+
+  // Agrupar gasto por fecha y destino (data.json)
   const destByDate = {};
+  // Filas detalladas para meta-ads-data.json
+  const adRows = [];
+
   adRaw.forEach(item => {
     const date = item.date_start;
-    const dest = extractDestination(item.ad_name || "");
+    const adName = item.ad_name || "";
+    const dest = extractDestination(adName);
     const spend = parseFloat(item.spend) || 0;
+
     if (!destByDate[date]) destByDate[date] = {};
     destByDate[date][dest] = (destByDate[date][dest] || 0) + spend;
+
+    adRows.push([
+      (date || "").replace(/-/g, ""),
+      item.campaign_id   || "",
+      item.campaign_name || "",
+      item.adset_id      || "",
+      item.adset_name    || "",
+      item.ad_id         || "",
+      adName,
+      dest,
+      Math.round(spend * 100) / 100,
+      parseInt(item.impressions) || 0,
+      parseInt(item.reach)       || 0,
+      Math.round((parseFloat(item.frequency) || 0) * 100) / 100,
+      parseInt(item.clicks)      || 0,
+      Math.round((parseFloat(item.ctr) || 0) * 100) / 100,
+      Math.round((parseFloat(item.cpm) || 0) * 100) / 100,
+      Math.round((parseFloat(item.cpp) || 0) * 100) / 100,
+      getAction(item.actions, "purchase"),
+      getAction(item.actions, "add_to_cart"),
+      getAction(item.actions, "initiate_checkout"),
+      getAction(item.actions, "landing_page_view"),
+      getAction(item.actions, "link_click"),
+      getVideoAction(item.video_p25_watched_actions),
+      getVideoAction(item.video_p50_watched_actions),
+      getVideoAction(item.video_p75_watched_actions),
+      getVideoAction(item.video_p100_watched_actions),
+    ]);
   });
 
+  // Guardar meta-ads-data.json
+  const metaAdsFile = loadJson(META_ADS_PATH, {
+    updated: "",
+    cols: ["date","campaign_id","campaign_name","adset_id","adset_name","ad_id","ad_name","dest","spend","impressions","reach","frequency","clicks","ctr","cpm","cpp","purchases","add_to_cart","initiated_checkout","landing_page_views","link_clicks","video_p25","video_p50","video_p75","video_p100"],
+    rows: [],
+  });
+  if (!Array.isArray(metaAdsFile.rows)) metaAdsFile.rows = [];
+  metaAdsFile.rows = metaAdsFile.rows.filter(r => { const d = parseInt(String(r[0])); return d < fromNum || d > toNum; });
+  metaAdsFile.rows.push(...adRows);
+  metaAdsFile.rows.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  metaAdsFile.updated = dateTo;
+  fs.writeFileSync(META_ADS_PATH, JSON.stringify(metaAdsFile), "utf8");
+  console.log(`  ✅ meta-ads-data.json — ${adRows.length} filas`);
+
   const dataFile = loadJson(DATA_PATH, { v: 1, updated: "", days: {} });
-  // Eliminar datos Meta del rango (conservar g y t)
   Object.keys(dataFile.days).forEach(dateStr => {
     const num = parseInt(dateStr.replace(/-/g, ""));
     if (num >= fromNum && num <= toNum && dataFile.days[dateStr]) {
       delete dataFile.days[dateStr].m;
     }
   });
-  // Insertar nuevos datos Meta
   Object.entries(destByDate).forEach(([date, destObj]) => {
     if (!dataFile.days[date]) dataFile.days[date] = {};
-    // Redondear a 2 decimales
     const rounded = {};
     Object.entries(destObj).forEach(([d, v]) => { rounded[d] = Math.round(v * 100) / 100; });
     dataFile.days[date].m = rounded;
